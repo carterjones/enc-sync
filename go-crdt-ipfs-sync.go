@@ -4,12 +4,18 @@ package main
 
 import (
 	"context"
+
+	logging "github.com/ipfs/go-log/v2"
+
+	"github.com/libp2p/go-libp2p"
+	pubsub "github.com/libp2p/go-libp2p-pubsub"
+	"github.com/libp2p/go-libp2p/core/host"
+
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"time"
@@ -19,7 +25,6 @@ import (
 	"github.com/ipfs/go-datastore/sync"
 	crdt "github.com/ipfs/go-ds-crdt"
 	ipfs "github.com/ipfs/go-ipfs-api"
-	pubsub "github.com/libp2p/go-libp2p-pubsub"
 )
 
 const (
@@ -45,11 +50,14 @@ func main() {
 
 	go watchForLocalEdits(watcher)
 
-	err = watcher.Add(TopDirectory)
-	if err != nil {
-		fmt.Println("Error adding directory to watcher:", err)
-		return
+	if _, err := os.Stat(TopDirectory); os.IsNotExist(err) {
+		err = os.Mkdir(TopDirectory, 0755)
+		if err != nil {
+			fmt.Println("Error creating tracked directory:", err)
+			return
+		}
 	}
+	err = watcher.Add(TopDirectory)
 
 	ticker := time.NewTicker(SyncInterval)
 	defer ticker.Stop()
@@ -68,12 +76,12 @@ func initializeCRDTState() {
 	// Create an in-memory datastore
 	memoryDs = sync.MutexWrap(datastore.NewMapDatastore())
 
-	// Set up PubSub (this assumes an already running libp2p PubSub network)
-	ps, err := pubsub.NewGossipSub(context.Background(), nil)
+	ps, host, err := initializeLibp2pPubSub()
 	if err != nil {
-		fmt.Println("Error creating PubSub:", err)
+		fmt.Println("Error initializing libp2p PubSub:", err)
 		return
 	}
+	defer host.Close()
 
 	// Create the CRDT datastore
 	broadcaster, err := crdt.NewPubSubBroadcaster(context.Background(), ps, "crdt-topic")
@@ -81,7 +89,12 @@ func initializeCRDTState() {
 		fmt.Println("Error creating PubSub broadcaster:", err)
 		return
 	}
-	crdtStore, err = crdt.New(memoryDs, datastore.NewKey("crdt-sync"), nil, broadcaster, &crdt.Options{})
+	crdtStore, err = crdt.New(memoryDs, datastore.NewKey("crdt-sync"), nil, broadcaster, &crdt.Options{
+		MaxBatchDeltaSize:   10,
+		NumWorkers:          1,
+		Logger:              logging.Logger("crdt"),
+		RebroadcastInterval: time.Minute, // Set a valid interval, e.g., 1 minute
+	})
 	if err != nil {
 		fmt.Println("Error initializing CRDT datastore:", err)
 		return
@@ -92,7 +105,7 @@ func initializeCRDTState() {
 			return err
 		}
 		if !info.IsDir() {
-			content, err := ioutil.ReadFile(path)
+			content, err := os.ReadFile(path)
 			if err != nil {
 				return err
 			}
@@ -115,7 +128,7 @@ func watchForLocalEdits(watcher *fsnotify.Watcher) {
 		case event := <-watcher.Events:
 			if event.Op&fsnotify.Write == fsnotify.Write {
 				filePath := event.Name
-				content, err := ioutil.ReadFile(filePath)
+				content, err := os.ReadFile(filePath)
 				if err != nil {
 					fmt.Println("Error reading modified file:", err)
 					continue
@@ -169,4 +182,22 @@ func decrypt(data, key []byte) ([]byte, error) {
 	stream.XORKeyStream(plaintext, data[aes.BlockSize:])
 
 	return plaintext, nil
+}
+
+func initializeLibp2pPubSub() (*pubsub.PubSub, host.Host, error) {
+	ctx := context.Background()
+
+	// Create a new libp2p host
+	h, err := libp2p.New()
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to create libp2p host: %w", err)
+	}
+
+	// Create a new PubSub instance using GossipSub
+	ps, err := pubsub.NewGossipSub(ctx, h)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to create PubSub: %w", err)
+	}
+
+	return ps, h, nil
 }
