@@ -5,16 +5,28 @@ if ! command -v ipfs > /dev/null; then
     brew install ipfs
 fi
 
+mkdir -p "${HOME}/.ipfs"
+
 if [[ ! -f "${HOME}/.ipfs/swarm.key" ]]; then
     IPFS_SWARM_KEY=$(openssl rand -hex 32)
     SWARM_KEY_PATH="${HOME}/.ipfs/swarm.key"
-    mkdir -p "${HOME}/.ipfs"
     echo "/key/swarm/psk/1.0.0/" > "${SWARM_KEY_PATH}"
     echo "/base16/" >> "${SWARM_KEY_PATH}"
     echo "${IPFS_SWARM_KEY}" >> "${SWARM_KEY_PATH}"
 fi
 
-ipfs init
-ipfs daemon
+if [[ ! -f "${HOME}/.ipfs/config" ]]; then
+    ipfs init
+    CONFIG_PATH="${HOME}/.ipfs/config"
+    set +x
+    PEER_ID=$(jq -r '.Identity.PeerID' "${CONFIG_PATH}")
+    PRIV_KEY=$(jq -r '.Identity.PrivKey' "${CONFIG_PATH}")
+    sed -e "s/replace-me-PeerID/${PEER_ID}/" \
+        -e "s|replace-me-PrivKey|${PRIV_KEY}|" \
+        ipfs-config-template.json > "${CONFIG_PATH}"
+    set -x
+    ipfs id
+fi
+
 ipfs bootstrap rm --all
-ipfs id
+ipfs daemon
