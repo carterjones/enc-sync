@@ -1,8 +1,4 @@
 {
-  "Identity": {
-    "PeerID": "replace-me-PeerID",
-    "PrivKey": "replace-me-PrivKey"
-  },
   "Datastore": {
     "StorageMax": "10GB",
     "StorageGCWatermark": 90,

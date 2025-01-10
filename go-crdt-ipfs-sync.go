@@ -4,16 +4,11 @@ package main
 
 import (
 	"context"
-
-	logging "github.com/ipfs/go-log/v2"
-
-	"github.com/libp2p/go-libp2p"
-	pubsub "github.com/libp2p/go-libp2p-pubsub"
-	"github.com/libp2p/go-libp2p/core/host"
-
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -21,10 +16,24 @@ import (
 	"time"
 
 	"github.com/fsnotify/fsnotify"
+	ipfslite "github.com/hsanjuan/ipfs-lite"
 	"github.com/ipfs/go-datastore"
 	"github.com/ipfs/go-datastore/sync"
 	crdt "github.com/ipfs/go-ds-crdt"
 	ipfs "github.com/ipfs/go-ipfs-api"
+	logging "github.com/ipfs/go-log/v2"
+	"github.com/ipfs/kubo/config"
+	core "github.com/ipfs/kubo/core"
+	"github.com/ipfs/kubo/core/coreapi"
+	coreiface "github.com/ipfs/kubo/core/coreiface"
+	"github.com/ipfs/kubo/plugin/loader"
+	"github.com/ipfs/kubo/repo/fsrepo"
+	repo "github.com/ipfs/kubo/repo/fsrepo"
+	"github.com/libp2p/go-libp2p"
+	pubsub "github.com/libp2p/go-libp2p-pubsub"
+	ipfscrypto "github.com/libp2p/go-libp2p/core/crypto"
+	"github.com/libp2p/go-libp2p/core/host"
+	"github.com/libp2p/go-libp2p/core/pnet"
 )
 
 const (
@@ -36,11 +45,38 @@ const (
 var (
 	shell     = ipfs.NewShell("localhost:5001")
 	crdtStore *crdt.Datastore
-	memoryDs  datastore.Datastore
+	memoryDs  *sync.MutexDatastore
 )
 
 func main() {
-	initializeCRDTState()
+	// Load config.
+	cfg, err := getConfig()
+	if err != nil {
+		fmt.Println("Error loading config:", err)
+		return
+	}
+
+	// Ensure the top directory exists.
+	if _, err := os.Stat(TopDirectory); os.IsNotExist(err) {
+		err = os.Mkdir(TopDirectory, 0755)
+		if err != nil {
+			fmt.Println("Error creating tracked directory:", err)
+			return
+		}
+	}
+
+	_, err = startIPFSNode(cfg)
+	if err != nil {
+		fmt.Println("Error starting IPFS node:", err)
+		return
+	}
+	fmt.Println("[+] IPFS node started.")
+
+	err = initializeCRDTState(cfg)
+	if err != nil {
+		fmt.Println("Error initializing CRDT state:", err)
+		return
+	}
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		fmt.Println("Error creating watcher:", err)
@@ -50,13 +86,6 @@ func main() {
 
 	go watchForLocalEdits(watcher)
 
-	if _, err := os.Stat(TopDirectory); os.IsNotExist(err) {
-		err = os.Mkdir(TopDirectory, 0755)
-		if err != nil {
-			fmt.Println("Error creating tracked directory:", err)
-			return
-		}
-	}
 	err = watcher.Add(TopDirectory)
 
 	ticker := time.NewTicker(SyncInterval)
@@ -72,34 +101,55 @@ func main() {
 	}
 }
 
-func initializeCRDTState() {
+func initializeCRDTState(cfg config.Config) error {
+	ctx := context.Background()
+
 	// Create an in-memory datastore
 	memoryDs = sync.MutexWrap(datastore.NewMapDatastore())
 
 	ps, host, err := initializeLibp2pPubSub()
 	if err != nil {
-		fmt.Println("Error initializing libp2p PubSub:", err)
-		return
+		return fmt.Errorf("error initializing libp2p PubSub: %w", err)
 	}
 	defer host.Close()
 
-	// Create the CRDT datastore
+	// Create the broadcaster
 	broadcaster, err := crdt.NewPubSubBroadcaster(context.Background(), ps, "crdt-topic")
 	if err != nil {
-		fmt.Println("Error creating PubSub broadcaster:", err)
-		return
+		return fmt.Errorf("error creating PubSub broadcaster: %w", err)
 	}
-	crdtStore, err = crdt.New(memoryDs, datastore.NewKey("crdt-sync"), nil, broadcaster, &crdt.Options{
+
+	decoded, err := base64.StdEncoding.DecodeString(cfg.Identity.PrivKey)
+	if err != nil {
+		return fmt.Errorf("error decoding private key: %w", err)
+	}
+	privKey, err := ipfscrypto.UnmarshalPrivateKey([]byte(decoded))
+	if err != nil {
+		return fmt.Errorf("error unmarshaling private key: %w", err)
+	}
+
+	p2pHost, dht, err := ipfslite.SetupLibp2p(ctx, privKey, pnet.PSK(EncryptionKey), nil, nil, nil)
+	if err != nil {
+		return fmt.Errorf("error creating DHT: %w", err)
+	}
+
+	peer, err := ipfslite.New(ctx, memoryDs, nil, p2pHost, dht, nil)
+	if err != nil {
+		return fmt.Errorf("error creating IPFS Lite: %w", err)
+	}
+
+	// Create the CRDT datastore with the DAG service
+	crdtStore, err = crdt.New(memoryDs, datastore.NewKey("crdt-sync"), peer.DAGService, broadcaster, &crdt.Options{
 		MaxBatchDeltaSize:   10,
 		NumWorkers:          1,
 		Logger:              logging.Logger("crdt"),
-		RebroadcastInterval: time.Minute, // Set a valid interval, e.g., 1 minute
+		RebroadcastInterval: time.Minute,
 	})
 	if err != nil {
-		fmt.Println("Error initializing CRDT datastore:", err)
-		return
+		return fmt.Errorf("error initializing CRDT datastore: %w", err)
 	}
 
+	// Walk through the tracked directory and add files to the CRDT store
 	err = filepath.Walk(TopDirectory, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
@@ -118,11 +168,14 @@ func initializeCRDTState() {
 		return nil
 	})
 	if err != nil {
-		fmt.Println("Error initializing CRDT state:", err)
+		return fmt.Errorf("error initializing CRDT state: %w", err)
 	}
+	return nil
 }
 
 func watchForLocalEdits(watcher *fsnotify.Watcher) {
+	fmt.Println("[+] File watcher started.")
+
 	for {
 		select {
 		case event := <-watcher.Events:
@@ -190,14 +243,81 @@ func initializeLibp2pPubSub() (*pubsub.PubSub, host.Host, error) {
 	// Create a new libp2p host
 	h, err := libp2p.New()
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to create libp2p host: %w", err)
+		return (*pubsub.PubSub)(nil), nil, fmt.Errorf("failed to create libp2p host: %w", err)
 	}
 
 	// Create a new PubSub instance using GossipSub
 	ps, err := pubsub.NewGossipSub(ctx, h)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to create PubSub: %w", err)
+		return (*pubsub.PubSub)(nil), nil, fmt.Errorf("failed to create PubSub: %w", err)
 	}
 
 	return ps, h, nil
+}
+
+func getConfig() (config.Config, error) {
+	cfg := config.Config{}
+
+	content, err := os.ReadFile("./ipfs-config-template.json")
+	if err != nil {
+		return config.Config{}, err
+	}
+
+	err = json.Unmarshal(content, &cfg)
+	if err != nil {
+		return config.Config{}, err
+	}
+
+	id, err := config.CreateIdentity(io.Discard, nil)
+	if err != nil {
+		return config.Config{}, fmt.Errorf("failed to create identity: %w", err)
+	}
+	cfg.Identity = id
+
+	return cfg, nil
+}
+
+func startIPFSNode(cfg config.Config) (coreiface.CoreAPI, error) {
+	ctx := context.Background()
+
+	// Open the IPFS repository
+	repoPath := filepath.Join(os.Getenv("HOME"), ".ipfs")
+	if !repo.IsInitialized(repoPath) {
+		plugins, err := loader.NewPluginLoader(repoPath)
+		if err != nil {
+			panic(fmt.Errorf("error loading plugins: %s", err))
+		}
+
+		if err := plugins.Initialize(); err != nil {
+			panic(fmt.Errorf("error initializing plugins: %s", err))
+		}
+
+		if err := plugins.Inject(); err != nil {
+			panic(fmt.Errorf("error initializing plugins: %s", err))
+		}
+
+		err = fsrepo.Init(repoPath, &cfg)
+		if err != nil {
+			return nil, fmt.Errorf("failed to initialize IPFS repo: %w", err)
+		}
+	}
+
+	r, err := fsrepo.Open(repoPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open IPFS repo: %w", err)
+	}
+
+	// Create and start the IPFS node
+	node, err := core.NewNode(ctx, &core.BuildCfg{
+		Repo:   r,
+		Online: true,
+	})
+
+	// Create CoreAPI instance from the IPFS node
+	api, err := coreapi.NewCoreAPI(node)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create IPFS CoreAPI: %w", err)
+	}
+
+	return api, nil
 }
