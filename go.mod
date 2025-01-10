@@ -1,11 +1,15 @@
 module go-crdt-ipfs-sync
 
-go 1.20
+go 1.23
+
+toolchain go1.23.4
 
 require (
 	github.com/fsnotify/fsnotify v1.8.0
+	github.com/ipfs/go-datastore v0.6.0
 	github.com/ipfs/go-ds-crdt v0.6.2
 	github.com/ipfs/go-ipfs-api v0.7.0
+	github.com/libp2p/go-libp2p-pubsub v0.12.0
 )
 
 require (
@@ -22,7 +26,6 @@ require (
 	github.com/ipfs/boxo v0.24.3 // indirect
 	github.com/ipfs/go-block-format v0.2.0 // indirect
 	github.com/ipfs/go-cid v0.4.1 // indirect
-	github.com/ipfs/go-datastore v0.6.0 // indirect
 	github.com/ipfs/go-ipfs-util v0.0.3 // indirect
 	github.com/ipfs/go-ipld-format v0.6.0 // indirect
 	github.com/ipfs/go-ipld-legacy v0.2.1 // indirect
@@ -35,7 +38,6 @@ require (
 	github.com/libp2p/go-buffer-pool v0.1.0 // indirect
 	github.com/libp2p/go-flow-metrics v0.2.0 // indirect
 	github.com/libp2p/go-libp2p v0.37.0 // indirect
-	github.com/libp2p/go-libp2p-pubsub v0.12.0 // indirect
 	github.com/libp2p/go-msgio v0.3.0 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/minio/sha256-simd v1.0.1 // indirect

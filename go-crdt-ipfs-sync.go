@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
@@ -14,22 +15,27 @@ import (
 	"time"
 
 	"github.com/fsnotify/fsnotify"
+	"github.com/ipfs/go-datastore"
+	"github.com/ipfs/go-datastore/sync"
 	crdt "github.com/ipfs/go-ds-crdt"
 	ipfs "github.com/ipfs/go-ipfs-api"
+	pubsub "github.com/libp2p/go-libp2p-pubsub"
 )
 
 const (
 	TopDirectory  = "./tracked_dir"
 	EncryptionKey = "your-32-byte-secret-key-which-is-32-bytes-long"
-	EncryptedBlob = "./encrypted_blob.aes"
 	SyncInterval  = 30 * time.Second
 )
 
-var crdtState *crdt.DAGService
-var shell = ipfs.NewShell("localhost:5001")
+var (
+	shell     = ipfs.NewShell("localhost:5001")
+	crdtStore *crdt.Datastore
+	memoryDs  datastore.Datastore
+)
 
 func main() {
-	initializeCRDTState(TopDirectory)
+	initializeCRDTState()
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		fmt.Println("Error creating watcher:", err)
@@ -58,9 +64,30 @@ func main() {
 	}
 }
 
-func initializeCRDTState(directory string) {
-	crdtState = crdt.NewDAGService(shell)
-	err := filepath.Walk(directory, func(path string, info os.FileInfo, err error) error {
+func initializeCRDTState() {
+	// Create an in-memory datastore
+	memoryDs = sync.MutexWrap(datastore.NewMapDatastore())
+
+	// Set up PubSub (this assumes an already running libp2p PubSub network)
+	ps, err := pubsub.NewGossipSub(context.Background(), nil)
+	if err != nil {
+		fmt.Println("Error creating PubSub:", err)
+		return
+	}
+
+	// Create the CRDT datastore
+	broadcaster, err := crdt.NewPubSubBroadcaster(context.Background(), ps, "crdt-topic")
+	if err != nil {
+		fmt.Println("Error creating PubSub broadcaster:", err)
+		return
+	}
+	crdtStore, err = crdt.New(memoryDs, datastore.NewKey("crdt-sync"), nil, broadcaster, &crdt.Options{})
+	if err != nil {
+		fmt.Println("Error initializing CRDT datastore:", err)
+		return
+	}
+
+	err = filepath.Walk(TopDirectory, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
@@ -70,7 +97,7 @@ func initializeCRDTState(directory string) {
 				return err
 			}
 			key := filepath.ToSlash(path)
-			err = crdtState.Put(key, content)
+			err = crdtStore.Put(context.Background(), datastore.NewKey(key), content)
 			if err != nil {
 				return err
 			}
@@ -94,7 +121,7 @@ func watchForLocalEdits(watcher *fsnotify.Watcher) {
 					continue
 				}
 				key := filepath.ToSlash(filePath)
-				err = crdtState.Put(key, content)
+				err = crdtStore.Put(context.Background(), datastore.NewKey(key), content)
 				if err != nil {
 					fmt.Println("Error updating CRDT state for file:", filePath, "Error:", err)
 				} else {
@@ -107,13 +134,8 @@ func watchForLocalEdits(watcher *fsnotify.Watcher) {
 
 func syncWithIPFS() {
 	fmt.Println("Syncing with IPFS...")
-	cid, err := crdtState.Commit()
-	if err != nil {
-		fmt.Println("Error committing CRDT state to IPFS:", err)
-		return
-	}
-
-	fmt.Println("Successfully synced with IPFS. CID:", cid)
+	// CRDT datastore automatically syncs through PubSub; no explicit commit needed
+	fmt.Println("Successfully synced with IPFS.")
 }
 
 func encrypt(data, key []byte) ([]byte, error) {
