@@ -1,29 +1,36 @@
-# Makefile for go-crdt-ipfs-sync
-
-APP_NAME := go-crdt-ipfs-sync
+APP_NAME := enc-sync
 SRC_FILES := $(wildcard *.go)
 GO := go
 
-# Default target
 all: build
 
-# Build the application
 build:
 	@echo "Building $(APP_NAME)..."
 	mkdir -p ./dist
 	$(GO) build -o ./dist/$(APP_NAME) $(SRC_FILES)
 
-# Run the application
-run: build
+run-server: build
 	@echo "Running $(APP_NAME)..."
-	./dist/$(APP_NAME)
+	./dist/$(APP_NAME) server server
 
-# Clean up generated files
+run-client1: build
+	@echo "Running $(APP_NAME)..."
+	./dist/$(APP_NAME) client client-1
+
+run-client2: build
+	@echo "Running $(APP_NAME)..."
+	./dist/$(APP_NAME) client client-2
+
+run-tests: clean-tests run
+
 clean:
 	@echo "Cleaning up..."
 	rm -f ./dist
 
-# Download and tidy up dependencies
+clean-tests:
+	@echo "Cleaning up test files..."
+	rm -rf ./dst-dir
+
 deps:
 	@echo "Downloading dependencies..."
 	$(GO) mod tidy

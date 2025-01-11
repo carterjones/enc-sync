@@ -1,1 +1,6 @@
+.secrets
+.settings
+client-1
+client-2
 dist
+server
